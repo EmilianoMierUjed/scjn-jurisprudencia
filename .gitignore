@@ -1,0 +1,39 @@
+# Base de datos (es el producto, se entrega vía USB)
+data/*.db
+data/*.db-journal
+data/*.db-wal
+*.db
+*.db-journal
+*.db-wal
+
+# CSV y JSON de descarga
+*.csv
+json/
+
+# Logs
+*.log
+data/*.log
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+venv/
+.venv/
+
+# IDE
+.vscode/
+.idea/
+*.sqbpro
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Legacy y archivos de descarga
+files.zip
+legacy/

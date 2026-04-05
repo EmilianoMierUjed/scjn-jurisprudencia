@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "scjn-jurisprudencia": {
+      "command": "C:\\Users\\NOMBRE\\AppData\\Local\\Programs\\Python\\Python310\\python.exe",
+      "args": ["C:\\scjn-tool\\server\\server.py"],
+      "env": {
+        "DB_PATH": "C:\\scjn-tool\\data\\scjn_tesis.db"
+      }
+    }
+  }
+}
