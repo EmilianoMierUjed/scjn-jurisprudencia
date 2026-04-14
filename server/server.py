@@ -1,274 +1,68 @@
 """
-MCP Server — Jurisprudencia SCJN
-Conecta Claude Desktop con la base de datos SQLite de ~300,000 criterios.
+MCP Server — Jurisprudencia SCJN (wrapper delgado sobre scjn_core).
+
+Conecta Claude Desktop con la base de datos SQLite de ~311,000 criterios.
 
 Cómo funciona:
 - Claude Desktop lanza este script como proceso hijo (vía stdio).
 - El server expone "tools" (funciones) que Claude puede llamar.
-- Claude decide cuándo llamar cada tool según la conversación con el abogado.
-- Los resultados regresan a Claude, que los interpreta y presenta al usuario.
+- Cada @mcp.tool() es un wrapper de una sola línea sobre scjn_core.search.
+- Toda la lógica jurídica (filtros, ranking, formato) vive en scjn_core,
+  para que también la pueda usar el CLI standalone (cli/scjn_cli.py).
 
 El abogado nunca ve este código. Solo habla con Claude.
 """
 
-import sqlite3
-import os
 import sys
-import re
-import logging
 from pathlib import Path
+
+# Permite ejecutar este script directamente sin instalar el paquete
+# (útil cuando Claude Desktop lo lanza con `python server/server.py`).
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
 from mcp.server.fastmcp import FastMCP
 
-# ── Logging (a stderr, NUNCA a stdout — stdout es el canal MCP) ──────────
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    stream=sys.stderr,
-)
-logger = logging.getLogger("scjn-mcp")
+from scjn_core import database, protocol, search, tools_v12
+from scjn_core.config import DB_PATH, get_logger
 
-# ── Configuración ────────────────────────────────────────────────────────
-_DEFAULT_DB = str(Path(__file__).parent.parent / "data" / "scjn_tesis.db")
-DB_PATH = os.environ.get("DB_PATH", _DEFAULT_DB)
-
-# ── Instrucciones estratégicas para Claude ───────────────────────────────
-INSTRUCCIONES = """
-Eres un abogado litigante experto en derecho mexicano. Tienes acceso a una base
-de datos local con ~311,000 criterios de la SCJN (jurisprudencias y tesis
-aisladas, desde 1911 hasta 2026) a través de herramientas MCP.
-
-Tu trabajo NO es ser un motor de búsqueda de texto. Es razonar como un abogado
-que busca jurisprudencia para GANAR un caso.
-
-IMPORTANTE: NUNCA inventes tesis, rubros, códigos de registro ni precedentes.
-TODA la información jurisprudencial que presentes DEBE provenir exclusivamente
-de los resultados de las herramientas de búsqueda. Si no encuentras resultados,
-dilo honestamente. Jamás alucines criterios judiciales.
-
-══════════════════════════════════════════════════════
-PROTOCOLO DE BÚSQUEDA — EJECUCIÓN OBLIGATORIA
-══════════════════════════════════════════════════════
-
-PASO 1 — DIAGNÓSTICO JURÍDICO (antes de usar herramientas):
-  Analiza el caso del usuario:
-  - Hechos clave, derechos vulnerados, tipo de procedimiento
-  - Etapa procesal, posición del usuario (actor/demandado/quejoso)
-  - Qué necesita probar para esta etapa específica
-  Descompón en conceptos jurídicos buscables con 3+ formulaciones
-  alternativas cada uno (el lenguaje de la SCJN varía entre épocas y salas).
-
-PASO 2 — BÚSQUEDA ITERATIVA (las 5 rondas son obligatorias):
-  Ronda 1: buscar_jurisprudencia con cada concepto principal.
-           Pasa TODAS las formulaciones alternativas como lista de términos.
-  Ronda 2: buscar_interseccion cruzando los 2-3 conceptos más importantes.
-  Ronda 3: leer_tesis_completa de las 5-10 tesis más prometedoras
-           para confirmar relevancia real (no confiar solo en el extracto).
-  Ronda 4: buscar_contradiccion para temas que lo ameriten.
-           Las contradicciones resueltas son especialmente valiosas.
-  Ronda 5: buscar_jurisprudencia con términos que la CONTRAPARTE usaría
-           para anticipar y preparar respuesta. OBLIGATORIA.
-
-PASO 3 — REGLA DE ORO:
-  Si una ronda da 0 resultados, NO reportar "no se encontró nada".
-  Reformular con sinónimos más amplios o conceptos análogos.
-  Solo reportar ausencia después de 3+ reformulaciones fallidas.
-  Si el tema es muy reciente, sugerir verificar en el SJF en línea.
-
-PASO 4 — CLASIFICACIÓN POR FUERZA VINCULANTE:
-  Nivel S: Jurisprudencia del Pleno SCJN — Obligatoria para TODOS
-  Nivel A: Jurisprudencia de Sala SCJN — Obligatoria (salvo para el Pleno)
-  Nivel B: Jurisprudencia de Pleno de Circuito/Regional — Obligatoria en circuito
-  Nivel C: Jurisprudencia de TCC — Obligatoria para juzgados del circuito
-  Nivel D: Tesis aislada de SCJN — Orientadora, persuasiva
-  Nivel E: Tesis aislada de TCC — Orientadora, útil como refuerzo
-
-PASO 5 — PRESENTACIÓN ESTRATÉGICA:
-  Organiza resultados por UTILIDAD ESTRATÉGICA, no por keywords:
-
-  1. CRITERIOS PRINCIPALES (directamente aplicables)
-     Para cada tesis: nivel de fuerza, rubro, código de registro, órgano,
-     época, año, extracto relevante (ratio decidendi), y POR QUÉ sirve
-     para este caso específico.
-
-  2. CRITERIOS DE REFUERZO (fortalecen la posición)
-
-  3. CRITERIOS DE RIESGO (podría usar la contraparte)
-     SIEMPRE incluye al menos 1 criterio adverso, con sugerencia
-     de cómo distinguirlo o neutralizarlo.
-
-  4. CRITERIOS ANÁLOGOS (aplicables por extensión o "con mayor razón")
-
-  5. RESUMEN EJECUTIVO:
-     - Total de criterios, jurisprudencias vs. tesis aisladas
-     - Cobertura: Sólida / Moderada / Débil
-     - Línea argumentativa sugerida basada en los hallazgos
-     - Vacíos probatorios detectados
-
-  Reglas:
-  - Máximo 15-20 tesis. Calidad sobre cantidad.
-  - Cita SIEMPRE con tesis_codigo para que el abogado verifique.
-  - Si la cobertura es débil, dilo claramente y sugiere alternativas.
-
-══════════════════════════════════════════════════════
-CONOCIMIENTO JURÍDICO DE REFERENCIA
-══════════════════════════════════════════════════════
-
-Obligatoriedad (Art. 217 Ley de Amparo):
-- Jurisprudencia del Pleno SCJN → todos los tribunales
-- Jurisprudencia de Salas SCJN → todos salvo el Pleno
-- Jurisprudencia de Plenos de Circuito → TCC y juzgados del circuito
-- Jurisprudencia de TCC → juzgados de distrito del circuito
-- Tesis aisladas → orientadoras, no vinculantes
-
-Épocas: 11a/12a (2021+) = máxima relevancia | 10a (2011-2021) = muy relevante
-| 9a (1995-2011) = relevante si el marco no cambió | Anteriores = histórico
-
-Materia cruzada — buscar además en:
-- Administrativa → Constitucional, Común
-- Civil → Constitucional, Común, Mercantil
-- Laboral → Administrativa, Constitucional
-- Penal → Constitucional, Común
-- Amparo → La materia del acto reclamado + Constitucional
-
-══════════════════════════════════════════════════════
-ERRORES QUE DEBES EVITAR
-══════════════════════════════════════════════════════
-1. Buscar con un solo término y rendirte → usa múltiples formulaciones.
-2. Filtrar por materias en la primera pasada → puede excluir tesis relevantes.
-3. Presentar tesis sin leer su texto completo → siempre lee las prometedoras.
-4. Ignorar el tipo de tesis → jurisprudencia ≠ tesis aislada.
-5. Ignorar la jerarquía del órgano → TCC del 1er circuito no vincula al 4to.
-6. Omitir la Ronda 5 → el abogado NECESITA saber qué puede citar el contrario.
-7. Entregar lista plana sin análisis → el abogado necesita estrategia, no catálogo.
-8. Asumir que la BD es exhaustiva → si es muy reciente, sugerir verificar en SJF.
-""".strip()
-
+logger = get_logger("scjn-mcp")
 
 # ── Inicializar el server MCP ────────────────────────────────────────────
-mcp = FastMCP("SCJN Jurisprudencia", instructions=INSTRUCCIONES)
+mcp = FastMCP("SCJN Jurisprudencia", instructions=protocol.INSTRUCCIONES)
 
 
-# ── Helpers ──────────────────────────────────────────────────────────────
-
-_fts_available = None
-
-
-def has_fts() -> bool:
-    """Verifica si la tabla FTS5 existe en la BD."""
-    global _fts_available
-    if _fts_available is not None:
-        return _fts_available
-    try:
-        conn = get_db_connection()
-        conn.execute("SELECT COUNT(*) FROM tesis_fts WHERE tesis_fts MATCH 'test'")
-        _fts_available = True
-        conn.close()
-        logger.info("FTS5 disponible — búsquedas rápidas activadas")
-    except Exception:
-        _fts_available = False
-        logger.warning("FTS5 NO disponible — usando LIKE (más lento)")
-    return _fts_available
+def _conn():
+    """Abre una conexión a la BD para usar dentro de cada tool."""
+    return database.connect()
 
 
-def get_db_connection() -> sqlite3.Connection:
-    """Abre conexión a la BD. Lanza error claro si no existe."""
-    if not Path(DB_PATH).exists():
-        raise FileNotFoundError(
-            f"No se encontró la base de datos en: {DB_PATH}\n"
-            f"Verifica que scjn_tesis.db esté en esa ruta."
-        )
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    return conn
-
-
-def sanitize_fts(term: str) -> str:
-    """Limpia un término para usarlo en FTS5 MATCH como frase."""
-    cleaned = re.sub(r'["\*\(\)\+\^\{\}\[\]~]', " ", term)
-    cleaned = " ".join(cleaned.split())
-    if not cleaned:
-        return ""
-    return f'"{cleaned}"'
-
-
-def build_fts_or(terms: list[str]) -> str:
-    """Construye expresión FTS5 OR a partir de una lista de términos."""
-    parts = [sanitize_fts(t) for t in terms if t.strip()]
-    parts = [p for p in parts if p]
-    return " OR ".join(parts) if parts else ""
-
-
-def rows_to_dicts(rows: list) -> list[dict]:
-    return [dict(row) for row in rows]
-
-
-# Orden para priorizar resultados por fuerza vinculante
-ORDEN_VINCULANTE = """
-    CASE WHEN LOWER(tipo_tesis) LIKE '%jurisprudencia%' THEN 0 ELSE 1 END,
-    CASE
-        WHEN LOWER(instancia) LIKE '%pleno%suprema%'
-          OR LOWER(instancia) LIKE '%pleno de la s%' THEN 0
-        WHEN LOWER(instancia) LIKE '%primera sala%'
-          OR LOWER(instancia) LIKE '%segunda sala%' THEN 1
-        WHEN LOWER(instancia) LIKE '%pleno%circuito%'
-          OR LOWER(instancia) LIKE '%pleno%region%' THEN 2
-        WHEN LOWER(instancia) LIKE '%tribunal%colegiado%' THEN 3
-        ELSE 4
-    END,
-    anio DESC
-"""
-
-
-def format_resultados(rows: list[dict], incluir_texto: bool = False) -> str:
-    """Formatea resultados para que Claude los interprete."""
-    if not rows:
-        return "Sin resultados para esta búsqueda."
-
-    partes = []
-    for i, row in enumerate(rows, 1):
-        lineas = [
-            f"--- Resultado {i} ---",
-            f"ID: {row.get('id_tesis', 'N/A')}",
-            f"Rubro: {row.get('rubro', 'N/A')}",
-            f"Codigo: {row.get('tesis_codigo', 'N/A')}",
-            f"Tipo: {row.get('tipo_tesis', 'N/A')}",
-            f"Instancia: {row.get('instancia', 'N/A')}",
-            f"Organo: {row.get('organo_juris', 'N/A')}" if row.get("organo_juris") else None,
-            f"Epoca: {row.get('epoca', 'N/A')}",
-            f"Anio: {row.get('anio', 'N/A')}",
-            f"Materia: {row.get('materias', 'N/A')}",
-        ]
-        lineas = [l for l in lineas if l is not None]
-
-        if incluir_texto and row.get("texto"):
-            lineas.append(f"Texto completo:\n{row['texto']}")
-        elif row.get("extracto"):
-            lineas.append(f"Extracto: {row['extracto']}")
-
-        if incluir_texto and row.get("precedentes"):
-            lineas.append(f"Precedentes: {row['precedentes']}")
-
-        partes.append("\n".join(lineas))
-
-    encabezado = f"Se encontraron {len(rows)} resultado(s).\n"
-    return encabezado + "\n\n".join(partes)
-
-
-# ── TOOL 1: Búsqueda conceptual ─────────────────────────────────────────
+# ════════════════════════════════════════════════════════════════════════
+# TOOL 1: Búsqueda conceptual (OR de sinónimos)
+# ════════════════════════════════════════════════════════════════════════
 
 @mcp.tool()
 def buscar_jurisprudencia(
     terminos: list[str],
     solo_jurisprudencia: bool = False,
-    epoca_minima: str = "",
+    materia: str = "",
+    instancia: str = "",
+    organo: str = "",
     anio_minimo: int = 0,
-    limite: int = 30,
+    anio_maximo: int = 0,
+    epocas: list[str] | None = None,
+    buscar_en: str = "todo",
+    orden: str = "vinculancia",
+    limite: int = 25,
 ) -> str:
     """Busca tesis y jurisprudencia en la base de datos de la SCJN.
 
     Pasa MULTIPLES terminos alternativos para el mismo concepto
     (sinonimos, formulaciones diferentes) para maximizar resultados.
-    Se buscan con OR: cualquier match cuenta.
+    Se buscan con OR: cualquier match cuenta. Los resultados se
+    ordenan por fuerza vinculante (Pleno SCJN > Salas > Plenos
+    Regionales > Plenos de Circuito > TCC) y relevancia BM25.
 
     Ejemplos de uso:
     - Derecho a la salud: ["derecho a la salud", "proteccion de la salud",
@@ -280,177 +74,217 @@ def buscar_jurisprudencia(
         terminos: Lista de terminos alternativos a buscar (sinonimos,
                   formulaciones diferentes del mismo concepto).
         solo_jurisprudencia: Si True, solo devuelve jurisprudencias
-                            (no tesis aisladas). Util para argumentos
-                            que necesitan criterio obligatorio.
-        epoca_minima: Filtrar por epoca (ej: "Decima Epoca").
-                      Dejar vacio para buscar en todas.
-        anio_minimo: Anio minimo de publicacion (ej: 2015).
-                     0 = sin filtro de anio.
-        limite: Maximo de resultados a devolver (default 30).
+                             (criterio obligatorio, no tesis aisladas).
+        materia: Filtra por materia (ej: "Civil", "Penal", "Laboral",
+                 "Administrativa", "Constitucional", "Comun"). Coincidencia
+                 parcial — una tesis con materia "Constitucional, Civil"
+                 matchea tanto "Civil" como "Constitucional".
+        instancia: Filtra por organo emisor. Presets:
+                   - "scjn" — todas las de la Suprema Corte
+                   - "pleno_scjn" — solo Pleno SCJN
+                   - "salas_scjn" — Primera y Segunda Sala
+                   - "primera_sala" / "segunda_sala"
+                   - "plenos_regionales" / "plenos_circuito"
+                   - "tcc" — Tribunales Colegiados de Circuito
+        organo: Filtro libre sobre organo_juris (ej: "Primer Tribunal Colegiado").
+        anio_minimo: Anio minimo de publicacion (0 = sin filtro).
+        anio_maximo: Anio maximo de publicacion (0 = sin filtro).
+        epocas: Lista de epocas a incluir. Acepta "decima", "10", "Decima Epoca",
+                etc. Ej: ["decima", "undecima", "duodecima"] → solo 10a, 11a y 12a.
+        buscar_en: Ambito de busqueda: "todo" (default), "rubro" (solo en el
+                   titulo, mas preciso), o "texto" (solo en el cuerpo).
+        orden: "vinculancia" (default — fuerza vinculante + relevancia),
+               "relevancia" (BM25 puro), "reciente" (por ano DESC).
+        limite: Maximo de resultados (default 25).
 
     Returns:
-        Resultados formateados con rubro, codigo, tipo, instancia,
-        epoca, anio, materia, y extracto del texto.
+        Resultados con rubro, codigo, tipo, instancia, organo, epoca,
+        anio, materia, fuente y snippet del fragmento que coincide.
     """
-    if not terminos:
-        return "Error: Debes proporcionar al menos un termino de busqueda."
-
-    conn = get_db_connection()
+    conn = _conn()
     try:
-        params = []
-
-        if has_fts():
-            # ── FTS5 (rápido) ──
-            fts_expr = build_fts_or(terminos)
-            if not fts_expr:
-                return "Error: Terminos invalidos."
-
-            where_clauses = [
-                "t.rowid IN (SELECT rowid FROM tesis_fts WHERE tesis_fts MATCH ?)"
-            ]
-            params.append(fts_expr)
-        else:
-            # ── Fallback LIKE (lento) ──
-            conds = []
-            for t in terminos:
-                t_lower = t.lower().strip()
-                conds.append("(LOWER(t.texto) LIKE ? OR LOWER(t.rubro) LIKE ?)")
-                params.extend([f"%{t_lower}%", f"%{t_lower}%"])
-            where_clauses = [f"({' OR '.join(conds)})"]
-
-        if solo_jurisprudencia:
-            where_clauses.append("LOWER(t.tipo_tesis) LIKE '%jurisprudencia%'")
-
-        if epoca_minima:
-            where_clauses.append("LOWER(t.epoca) LIKE ?")
-            params.append(f"%{epoca_minima.lower()}%")
-
-        if anio_minimo > 0:
-            where_clauses.append("t.anio >= ?")
-            params.append(anio_minimo)
-
-        query = f"""
-        SELECT t.id_tesis, t.rubro, t.tipo_tesis, t.instancia, t.epoca,
-               t.anio, t.materias, t.tesis_codigo,
-               substr(t.texto, 1, 600) AS extracto
-        FROM tesis t
-        WHERE {' AND '.join(where_clauses)}
-        ORDER BY {ORDEN_VINCULANTE}
-        LIMIT ?
-        """
-        params.append(limite)
-
-        cursor = conn.execute(query, params)
-        rows = rows_to_dicts(cursor.fetchall())
-
-        logger.info(
-            f"buscar_jurisprudencia: {len(rows)} resultados "
-            f"para {len(terminos)} terminos (FTS={'si' if has_fts() else 'no'})"
+        return search.buscar_jurisprudencia(
+            conn,
+            terminos=terminos,
+            solo_jurisprudencia=solo_jurisprudencia,
+            materia=materia,
+            instancia=instancia,
+            organo=organo,
+            anio_minimo=anio_minimo,
+            anio_maximo=anio_maximo,
+            epocas=epocas,
+            buscar_en=buscar_en,
+            orden=orden,
+            limite=limite,
         )
-        return format_resultados(rows)
-
-    except Exception as e:
-        logger.error(f"Error en buscar_jurisprudencia: {e}")
-        return f"Error en la busqueda: {e}"
     finally:
         conn.close()
 
 
-# ── TOOL 2: Búsqueda interseccional ─────────────────────────────────────
+# ════════════════════════════════════════════════════════════════════════
+# TOOL 2: Búsqueda interseccional (A AND B [AND C])
+# ════════════════════════════════════════════════════════════════════════
 
 @mcp.tool()
 def buscar_interseccion(
     concepto_a: list[str],
     concepto_b: list[str],
+    concepto_c: list[str] | None = None,
     solo_jurisprudencia: bool = False,
+    materia: str = "",
+    instancia: str = "",
+    organo: str = "",
     anio_minimo: int = 0,
-    limite: int = 30,
+    anio_maximo: int = 0,
+    epocas: list[str] | None = None,
+    orden: str = "vinculancia",
+    limite: int = 25,
 ) -> str:
-    """Busca tesis que contengan DOS conceptos simultaneamente.
+    """Busca tesis que contengan DOS O TRES conceptos simultaneamente.
 
     Cada concepto acepta multiples formulaciones alternativas (OR dentro
-    de cada concepto, AND entre los dos conceptos).
+    de cada concepto, AND entre los conceptos).
 
-    Ejemplo: Buscar tesis sobre derecho a la salud EN el ISSSTE:
+    Ejemplo 1: tesis sobre derecho a la salud EN el ISSSTE:
     - concepto_a: ["derecho a la salud", "proteccion de la salud"]
     - concepto_b: ["ISSSTE", "seguridad social", "derechohabiente"]
 
+    Ejemplo 2: tesis sobre suspension de amparo en materia laboral por despido:
+    - concepto_a: ["suspension", "medida cautelar"]
+    - concepto_b: ["amparo"]
+    - concepto_c: ["despido", "rescision", "terminacion de la relacion"]
+
     Args:
-        concepto_a: Primer concepto (con formulaciones alternativas).
-        concepto_b: Segundo concepto (con formulaciones alternativas).
+        concepto_a: Primer concepto (formulaciones alternativas).
+        concepto_b: Segundo concepto.
+        concepto_c: Tercer concepto opcional (deja None para solo 2 conceptos).
         solo_jurisprudencia: Solo jurisprudencias (criterio obligatorio).
-        anio_minimo: Anio minimo (0 = sin filtro).
-        limite: Maximo de resultados.
+        materia, instancia, organo, anio_minimo, anio_maximo, epocas, orden, limite:
+            Ver buscar_jurisprudencia para descripcion.
 
     Returns:
-        Tesis que contienen AMBOS conceptos.
+        Tesis que contienen TODOS los conceptos, ordenadas por fuerza
+        vinculante y relevancia, con snippet del match.
     """
-    if not concepto_a or not concepto_b:
-        return "Error: Ambos conceptos deben tener al menos un termino."
-
-    conn = get_db_connection()
+    conn = _conn()
     try:
-        params = []
-
-        if has_fts():
-            # ── FTS5: AND entre dos grupos OR ──
-            fts_a = build_fts_or(concepto_a)
-            fts_b = build_fts_or(concepto_b)
-            if not fts_a or not fts_b:
-                return "Error: Terminos invalidos."
-
-            fts_expr = f"({fts_a}) AND ({fts_b})"
-            where_clauses = [
-                "t.rowid IN (SELECT rowid FROM tesis_fts WHERE tesis_fts MATCH ?)"
-            ]
-            params.append(fts_expr)
-        else:
-            # ── Fallback LIKE ──
-            conds_a = []
-            for t in concepto_a:
-                conds_a.append("(LOWER(t.texto) LIKE ? OR LOWER(t.rubro) LIKE ?)")
-                params.extend([f"%{t.lower().strip()}%"] * 2)
-            conds_b = []
-            for t in concepto_b:
-                conds_b.append("(LOWER(t.texto) LIKE ? OR LOWER(t.rubro) LIKE ?)")
-                params.extend([f"%{t.lower().strip()}%"] * 2)
-            where_clauses = [
-                f"({' OR '.join(conds_a)})",
-                f"({' OR '.join(conds_b)})",
-            ]
-
-        if solo_jurisprudencia:
-            where_clauses.append("LOWER(t.tipo_tesis) LIKE '%jurisprudencia%'")
-
-        if anio_minimo > 0:
-            where_clauses.append("t.anio >= ?")
-            params.append(anio_minimo)
-
-        query = f"""
-        SELECT t.id_tesis, t.rubro, t.tipo_tesis, t.instancia, t.epoca,
-               t.anio, t.materias, t.tesis_codigo,
-               substr(t.texto, 1, 600) AS extracto
-        FROM tesis t
-        WHERE {' AND '.join(where_clauses)}
-        ORDER BY {ORDEN_VINCULANTE}
-        LIMIT ?
-        """
-        params.append(limite)
-
-        cursor = conn.execute(query, params)
-        rows = rows_to_dicts(cursor.fetchall())
-
-        logger.info(f"buscar_interseccion: {len(rows)} resultados")
-        return format_resultados(rows)
-
-    except Exception as e:
-        logger.error(f"Error en buscar_interseccion: {e}")
-        return f"Error en la busqueda: {e}"
+        return search.buscar_interseccion(
+            conn,
+            concepto_a=concepto_a,
+            concepto_b=concepto_b,
+            concepto_c=concepto_c,
+            solo_jurisprudencia=solo_jurisprudencia,
+            materia=materia,
+            instancia=instancia,
+            organo=organo,
+            anio_minimo=anio_minimo,
+            anio_maximo=anio_maximo,
+            epocas=epocas,
+            orden=orden,
+            limite=limite,
+        )
     finally:
         conn.close()
 
 
-# ── TOOL 3: Lectura completa de una tesis ────────────────────────────────
+# ════════════════════════════════════════════════════════════════════════
+# TOOL 3: Búsqueda por proximidad (NEAR)
+# ════════════════════════════════════════════════════════════════════════
+
+@mcp.tool()
+def buscar_proximidad(
+    termino_a: str,
+    termino_b: str,
+    distancia: int = 15,
+    solo_jurisprudencia: bool = False,
+    materia: str = "",
+    instancia: str = "",
+    anio_minimo: int = 0,
+    limite: int = 25,
+) -> str:
+    """Busca tesis donde dos terminos aparecen CERCA en el texto.
+
+    Util cuando dos conceptos deben estar relacionados dentro de la misma
+    frase o parrafo (no solo en la misma tesis). Ejemplo: "despido" NEAR
+    "carga de la prueba" encontrara solo tesis donde ambos conceptos estan
+    a lo sumo a 15 palabras de distancia, lo que implica que la tesis
+    realmente razona sobre la relacion entre ambos.
+
+    Args:
+        termino_a: Primer termino o frase.
+        termino_b: Segundo termino o frase.
+        distancia: Distancia maxima en tokens (default 15).
+                   Menor = mas estricto y preciso.
+        solo_jurisprudencia, materia, instancia, anio_minimo, limite:
+            Ver buscar_jurisprudencia.
+
+    Returns:
+        Tesis donde ambos terminos aparecen dentro de la distancia dada.
+    """
+    conn = _conn()
+    try:
+        return search.buscar_proximidad(
+            conn,
+            termino_a=termino_a,
+            termino_b=termino_b,
+            distancia=distancia,
+            solo_jurisprudencia=solo_jurisprudencia,
+            materia=materia,
+            instancia=instancia,
+            anio_minimo=anio_minimo,
+            limite=limite,
+        )
+    finally:
+        conn.close()
+
+
+# ════════════════════════════════════════════════════════════════════════
+# TOOL 4: Búsqueda por rubro (títulos)
+# ════════════════════════════════════════════════════════════════════════
+
+@mcp.tool()
+def buscar_rubro(
+    terminos: list[str],
+    solo_jurisprudencia: bool = False,
+    materia: str = "",
+    instancia: str = "",
+    anio_minimo: int = 0,
+    limite: int = 25,
+) -> str:
+    """Busca SOLO en los rubros (titulos) de las tesis.
+
+    Es la herramienta mas precisa cuando el abogado recuerda parte del
+    titulo de un criterio, o quiere ver que tesis existen bajo un tema
+    muy especifico. Los rubros son mas cortos y limpios que los textos,
+    asi que esta busqueda casi nunca devuelve falsos positivos.
+
+    Args:
+        terminos: Palabras clave que deben aparecer en el rubro
+                  (busqueda OR entre terminos).
+        solo_jurisprudencia, materia, instancia, anio_minimo, limite:
+            Ver buscar_jurisprudencia.
+
+    Returns:
+        Tesis cuyos rubros contienen alguno de los terminos.
+    """
+    conn = _conn()
+    try:
+        return search.buscar_rubro(
+            conn,
+            terminos=terminos,
+            solo_jurisprudencia=solo_jurisprudencia,
+            materia=materia,
+            instancia=instancia,
+            anio_minimo=anio_minimo,
+            limite=limite,
+        )
+    finally:
+        conn.close()
+
+
+# ════════════════════════════════════════════════════════════════════════
+# TOOL 5: Lectura completa de una tesis
+# ════════════════════════════════════════════════════════════════════════
 
 @mcp.tool()
 def leer_tesis_completa(identificador: str, campo: str = "id_tesis") -> str:
@@ -472,110 +306,126 @@ def leer_tesis_completa(identificador: str, campo: str = "id_tesis") -> str:
         Texto completo de la tesis, incluyendo rubro, texto, precedentes,
         y todos los metadatos.
     """
-    conn = get_db_connection()
+    conn = _conn()
     try:
-        campos_select = """
-            rubro, texto, precedentes, tipo_tesis, instancia,
-            organo_juris, epoca, anio, tesis_codigo, materias, id_tesis
-        """
-
-        if campo == "rubro":
-            query = f"SELECT {campos_select} FROM tesis WHERE LOWER(rubro) LIKE ? LIMIT 5"
-            params = [f"%{identificador.lower()}%"]
-        elif campo == "tesis_codigo":
-            query = f"SELECT {campos_select} FROM tesis WHERE tesis_codigo LIKE ? LIMIT 5"
-            params = [f"%{identificador}%"]
-        else:
-            query = f"SELECT {campos_select} FROM tesis WHERE id_tesis = ? LIMIT 1"
-            params = [identificador]
-
-        cursor = conn.execute(query, params)
-        rows = rows_to_dicts(cursor.fetchall())
-
-        if not rows:
-            return f"No se encontro tesis con {campo} = '{identificador}'"
-
-        return format_resultados(rows, incluir_texto=True)
-
-    except Exception as e:
-        logger.error(f"Error en leer_tesis_completa: {e}")
-        return f"Error: {e}"
+        return search.leer_tesis_completa(conn, identificador=identificador, campo=campo)
     finally:
         conn.close()
 
 
-# ── TOOL 4: Búsqueda por contradicción de tesis ─────────────────────────
+# ════════════════════════════════════════════════════════════════════════
+# TOOL 6: Lectura batch de varias tesis
+# ════════════════════════════════════════════════════════════════════════
 
 @mcp.tool()
-def buscar_contradiccion(terminos: list[str], limite: int = 15) -> str:
+def leer_varias_tesis(
+    identificadores: list[str],
+    campo: str = "id_tesis",
+) -> str:
+    """Lee el texto completo de varias tesis en una sola llamada.
+
+    Evita el ida y vuelta de llamar leer_tesis_completa N veces. Ideal
+    para la Ronda 3 del protocolo (confirmar 5-10 tesis prometedoras).
+
+    Args:
+        identificadores: Lista de id_tesis o codigos (maximo 15).
+        campo: "id_tesis" (default) o "tesis_codigo".
+
+    Returns:
+        Texto completo de todas las tesis encontradas.
+    """
+    conn = _conn()
+    try:
+        return search.leer_varias_tesis(conn, identificadores=identificadores, campo=campo)
+    finally:
+        conn.close()
+
+
+# ════════════════════════════════════════════════════════════════════════
+# TOOL 7: Búsqueda por contradicción de tesis
+# ════════════════════════════════════════════════════════════════════════
+
+@mcp.tool()
+def buscar_contradiccion(
+    terminos: list[str],
+    instancia: str = "",
+    anio_minimo: int = 0,
+    limite: int = 20,
+) -> str:
     """Busca jurisprudencias surgidas de contradiccion de tesis.
 
     Las contradicciones de tesis resueltas son especialmente valiosas
     porque unifican criterios discrepantes entre tribunales. Son oro
     para el litigante.
 
+    Busca en dos lugares:
+    1. Rubros que empiecen con "CONTRADICCIÓN DE TESIS"
+    2. Precedentes que mencionen explicitamente una contradiccion
+       (campo `precedentes`, no solo el texto).
+
     Args:
         terminos: Conceptos a buscar dentro de las contradicciones.
+        instancia: Filtro opcional por organo (ver buscar_jurisprudencia).
+        anio_minimo: Solo contradicciones desde este anio.
         limite: Maximo de resultados.
 
     Returns:
-        Jurisprudencias por contradiccion de tesis relacionadas.
+        Jurisprudencias por contradiccion de tesis relacionadas al tema.
     """
-    if not terminos:
-        return "Error: Proporciona al menos un termino."
-
-    conn = get_db_connection()
+    conn = _conn()
     try:
-        params = []
-
-        if has_fts():
-            # FTS5: buscar términos AND "contradicción de tesis"
-            fts_terminos = build_fts_or(terminos)
-            if not fts_terminos:
-                return "Error: Terminos invalidos."
-            fts_expr = f'({fts_terminos}) AND "contradiccion de tesis"'
-            where_clauses = [
-                "t.rowid IN (SELECT rowid FROM tesis_fts WHERE tesis_fts MATCH ?)"
-            ]
-            params.append(fts_expr)
-        else:
-            conds = []
-            for t in terminos:
-                conds.append("LOWER(t.texto) LIKE ?")
-                params.append(f"%{t.lower().strip()}%")
-            where_clauses = [
-                f"({' OR '.join(conds)})",
-                "(LOWER(t.texto) LIKE '%contradicci_n de tesis%'"
-                " OR LOWER(t.rubro) LIKE '%contradicci_n de tesis%')",
-            ]
-
-        where_clauses.append("LOWER(t.tipo_tesis) LIKE '%jurisprudencia%'")
-
-        query = f"""
-        SELECT t.id_tesis, t.rubro, t.tipo_tesis, t.instancia, t.epoca,
-               t.anio, t.materias, t.tesis_codigo,
-               substr(t.texto, 1, 600) AS extracto
-        FROM tesis t
-        WHERE {' AND '.join(where_clauses)}
-        ORDER BY t.anio DESC
-        LIMIT ?
-        """
-        params.append(limite)
-
-        cursor = conn.execute(query, params)
-        rows = rows_to_dicts(cursor.fetchall())
-
-        logger.info(f"buscar_contradiccion: {len(rows)} resultados")
-        return format_resultados(rows)
-
-    except Exception as e:
-        logger.error(f"Error en buscar_contradiccion: {e}")
-        return f"Error: {e}"
+        return search.buscar_contradiccion(
+            conn,
+            terminos=terminos,
+            instancia=instancia,
+            anio_minimo=anio_minimo,
+            limite=limite,
+        )
     finally:
         conn.close()
 
 
-# ── TOOL 5: Explorar valores de la BD ────────────────────────────────────
+# ════════════════════════════════════════════════════════════════════════
+# TOOL 8: Buscar tesis similares a una dada
+# ════════════════════════════════════════════════════════════════════════
+
+@mcp.tool()
+def buscar_similares(
+    id_tesis: str,
+    limite: int = 15,
+    solo_jurisprudencia: bool = False,
+) -> str:
+    """Encuentra tesis similares a una tesis dada.
+
+    Toma el rubro de la tesis de referencia y busca otras con lenguaje
+    similar, ordenadas por relevancia BM25. Ideal para reconstruir la
+    linea jurisprudencial completa de un tema una vez que encontraste
+    el criterio clave.
+
+    Args:
+        id_tesis: ID de la tesis de referencia.
+        limite: Maximo de resultados.
+        solo_jurisprudencia: Si True, excluye tesis aisladas.
+
+    Returns:
+        Lista de tesis con rubros similares al de la tesis dada,
+        ordenadas por relevancia.
+    """
+    conn = _conn()
+    try:
+        return search.buscar_similares(
+            conn,
+            id_tesis=id_tesis,
+            limite=limite,
+            solo_jurisprudencia=solo_jurisprudencia,
+        )
+    finally:
+        conn.close()
+
+
+# ════════════════════════════════════════════════════════════════════════
+# TOOL 9: Explorar valores de la BD
+# ════════════════════════════════════════════════════════════════════════
 
 @mcp.tool()
 def explorar_valores(campo: str, limite: int = 30) -> str:
@@ -586,113 +436,152 @@ def explorar_valores(campo: str, limite: int = 30) -> str:
 
     Args:
         campo: Nombre del campo a explorar. Opciones: tipo_tesis,
-               epoca, instancia, materias, organo_juris.
+               epoca, instancia, materias, organo_juris, fuente.
         limite: Maximo de valores unicos a mostrar.
 
     Returns:
         Lista de valores unicos encontrados con su frecuencia.
     """
-    campos_permitidos = {
-        "tipo_tesis", "epoca", "instancia", "materias", "organo_juris"
-    }
-    if campo not in campos_permitidos:
-        return (
-            f"Campo no permitido: '{campo}'. "
-            f"Usa uno de: {', '.join(sorted(campos_permitidos))}"
-        )
-
-    conn = get_db_connection()
+    conn = _conn()
     try:
-        cursor = conn.execute(
-            f"SELECT DISTINCT {campo}, COUNT(*) as total "
-            f"FROM tesis GROUP BY {campo} ORDER BY total DESC LIMIT ?",
-            [limite],
-        )
-        rows = cursor.fetchall()
-
-        resultado = f"Valores unicos en '{campo}' ({len(rows)} mostrados):\n\n"
-        for row in rows:
-            resultado += f"  - {row[0]}  ({row[1]:,} tesis)\n"
-
-        return resultado
-
-    except Exception as e:
-        logger.error(f"Error en explorar_valores: {e}")
-        return f"Error: {e}"
+        return search.explorar_valores(conn, campo=campo, limite=limite)
     finally:
         conn.close()
 
 
-# ── TOOL 6: Info de la base de datos ─────────────────────────────────────
+# ════════════════════════════════════════════════════════════════════════
+# TOOL 10: Info de la base de datos
+# ════════════════════════════════════════════════════════════════════════
 
 @mcp.tool()
 def info_base_datos() -> str:
     """Muestra estadisticas y estado actual de la base de datos.
 
     Llama a esta herramienta cuando el usuario pregunte que tan
-    actualizada esta la base de datos o cuantos criterios contiene.
+    actualizada esta la base de datos, cuantos criterios contiene,
+    o antes de explicar los limites del producto.
 
     Returns:
-        Total de tesis, rango de anios, ultima actualizacion, y
-        desglose por tipo.
+        Total de tesis, rango de anios, ultima actualizacion, desglose
+        por tipo, por epoca y por instancia, y estado del indice FTS5.
     """
-    conn = get_db_connection()
+    # Lee VERSION del repo y el log de la última actualización para que
+    # info_base_datos los pueda mostrar.
+    version_path = _REPO_ROOT / "VERSION"
+    version = "desconocida"
+    if version_path.exists():
+        try:
+            version = version_path.read_text(encoding="utf-8").strip()
+        except Exception:
+            pass
+
+    log_path = Path(DB_PATH).parent / "ultimo_update.log"
+
+    conn = _conn()
     try:
-        total = conn.execute("SELECT COUNT(*) FROM tesis").fetchone()[0]
+        return search.info_base_datos(
+            conn,
+            version=version,
+            log_path=str(log_path),
+        )
+    finally:
+        conn.close()
 
-        row = conn.execute(
-            "SELECT MIN(anio), MAX(anio) FROM tesis WHERE anio > 0"
-        ).fetchone()
-        anio_min, anio_max = row[0], row[1]
 
-        por_tipo = conn.execute(
-            "SELECT tipo_tesis, COUNT(*) FROM tesis "
-            "GROUP BY tipo_tesis ORDER BY COUNT(*) DESC"
-        ).fetchall()
+# ════════════════════════════════════════════════════════════════════════
+# TOOL 11: Extraer cita oficial (v1.2)
+# ════════════════════════════════════════════════════════════════════════
 
-        ultima = conn.execute(
-            "SELECT MAX(fecha_descarga) FROM tesis"
-        ).fetchone()[0]
+@mcp.tool()
+def extraer_cita_oficial(identificador: str, campo: str = "id_tesis") -> str:
+    """Devuelve la cita formal lista para pegar en un escrito legal mexicano.
 
-        # Verificar si FTS5 está activo
-        fts_status = "Activo (busquedas rapidas)" if has_fts() else "No disponible (busquedas lentas)"
+    Construye el formato canónico del Manual de Estilo del SJF a partir de
+    los campos sueltos de la tesis (codigo, fuente, época, mes/año, registro
+    digital). Útil cuando ya identificaste la tesis con buscar_* y necesitas
+    la línea exacta para pegar en una demanda o un amparo.
 
-        # Leer versión del producto
-        version_path = Path(__file__).parent.parent / "VERSION"
-        version = "desconocida"
-        if version_path.exists():
-            try:
-                version = version_path.read_text(encoding="utf-8").strip()
-            except Exception:
-                pass
+    Args:
+        identificador: id_tesis (default) o tesis_codigo de la tesis.
+        campo: "id_tesis" (default) o "tesis_codigo".
 
-        resultado = [
-            "=== Estado de la Base de Datos SCJN ===",
-            f"Version del producto: {version}",
-            f"Total de criterios: {total:,}",
-            f"Rango temporal: {anio_min} - {anio_max}",
-            f"Ultima descarga: {ultima or 'No registrada'}",
-            f"Indice FTS5: {fts_status}",
-            "",
-            "Desglose por tipo:",
-        ]
-        for tipo, count in por_tipo:
-            resultado.append(f"  - {tipo}: {count:,}")
+    Returns:
+        Cita oficial + rubro + órgano emisor.
+    """
+    conn = _conn()
+    try:
+        return tools_v12.extraer_cita_oficial(conn, identificador=identificador, campo=campo)
+    finally:
+        conn.close()
 
-        # Log de última actualización automática
-        log_path = Path(DB_PATH).parent / "ultimo_update.log"
-        if log_path.exists():
-            try:
-                log_content = log_path.read_text(encoding="utf-8").strip()
-                resultado.append(f"\nUltima actualizacion automatica:\n{log_content}")
-            except Exception:
-                pass
 
-        return "\n".join(resultado)
+# ════════════════════════════════════════════════════════════════════════
+# TOOL 12: Compilar línea jurisprudencial (v1.2)
+# ════════════════════════════════════════════════════════════════════════
 
-    except Exception as e:
-        logger.error(f"Error en info_base_datos: {e}")
-        return f"Error: {e}"
+@mcp.tool()
+def compilar_linea_jurisprudencial(
+    tema: list[str],
+    anio_minimo: int = 2010,
+    instancia: str = "",
+    limite: int = 30,
+) -> str:
+    """Devuelve cronología de jurisprudencias sobre un tema.
+
+    Útil para argumentar evolución del criterio en un escrito (ej:
+    "como ha venido sosteniéndose desde 2018, esta Sala…"). Ordena
+    ascendente por año y agrupa por época, marcando cambios de etapa.
+
+    Args:
+        tema: Lista de términos alternativos del tema.
+        anio_minimo: Solo jurisprudencias desde este año (default 2010).
+        instancia: Filtro opcional por preset de instancia.
+        limite: Máximo de resultados.
+
+    Returns:
+        Cronología agrupada por época.
+    """
+    conn = _conn()
+    try:
+        return tools_v12.compilar_linea_jurisprudencial(
+            conn, tema=tema, anio_minimo=anio_minimo, instancia=instancia, limite=limite,
+        )
+    finally:
+        conn.close()
+
+
+# ════════════════════════════════════════════════════════════════════════
+# TOOL 13: Obligatorios para circuito (v1.2)
+# ════════════════════════════════════════════════════════════════════════
+
+@mcp.tool()
+def buscar_obligatorios_para_circuito(
+    circuito: str,
+    terminos: list[str],
+    limite: int = 30,
+) -> str:
+    """Filtra jurisprudencia obligatoria para un circuito específico.
+
+    Para un abogado en el 17º circuito (Durango), el universo de criterios
+    obligatorios son: Pleno SCJN + Salas SCJN + Plenos Regionales +
+    Plenos del propio circuito + TCCs del propio circuito. Esta tool
+    aplica ese filtro automáticamente.
+
+    Args:
+        circuito: Número (1-32), romano ("XVII") o ordinal castellano
+                  ("decimo septimo"). Acepta acentos o no.
+        terminos: Lista de términos del tema.
+        limite: Máximo de resultados.
+
+    Returns:
+        Jurisprudencias obligatorias para ese circuito, ordenadas por
+        fuerza vinculante.
+    """
+    conn = _conn()
+    try:
+        return tools_v12.buscar_obligatorios_para_circuito(
+            conn, circuito=circuito, terminos=terminos, limite=limite,
+        )
     finally:
         conn.close()
 

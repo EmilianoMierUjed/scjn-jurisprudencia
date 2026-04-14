@@ -1,0 +1,13 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "scjn-tool"
+version = "1.2.0"
+description = "Herramienta de búsqueda de jurisprudencia SCJN para abogados litigantes"
+requires-python = ">=3.10"
+authors = [{ name = "SCJN Tool" }]
+
+[tool.setuptools]
+packages = ["scjn_core"]

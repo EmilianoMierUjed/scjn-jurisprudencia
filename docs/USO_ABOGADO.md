@@ -36,10 +36,14 @@ mas relevantes para tu caso.
 Claude organiza los resultados en 4 categorias:
 
 1. **Criterios Principales** — Los que directamente aplican a tu caso.
-   Fijate en el NIVEL (S, A, B, C, D, E):
-   - S y A = Jurisprudencia de la SCJN, OBLIGATORIA para todos los tribunales
-   - B y C = Jurisprudencia de Circuito, obligatoria en su circuito
-   - D y E = Tesis aisladas, orientadoras pero no obligatorias
+   Fijate en el NIVEL (S, A, B, C, D, E, F):
+   - **S** = Jurisprudencia del Pleno SCJN — obligatoria para todos los tribunales
+   - **A** = Jurisprudencia de Primera o Segunda Sala SCJN — obligatoria (salvo al Pleno)
+   - **B** = Jurisprudencia de Plenos Regionales — obligatoria en su region
+   - **C** = Jurisprudencia de Plenos de Circuito — obligatoria en su circuito
+   - **D** = Jurisprudencia de TCC — obligatoria para juzgados del circuito
+   - **E** = Tesis aislada de SCJN — orientadora, fuerte persuasion
+   - **F** = Tesis aislada de TCC u otros — orientadora, util como refuerzo
 
 2. **Criterios de Refuerzo** — Complementan tu argumento.
 

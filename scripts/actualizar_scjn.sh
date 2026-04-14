@@ -21,13 +21,13 @@ fi
 cd "$DIRECTORIO"
 
 # Contar tesis ANTES de actualizar
-ANTES=$($PYTHON -c "import sqlite3; c=sqlite3.connect('scjn_tesis.db'); print(c.execute('SELECT COUNT(*) FROM tesis').fetchone()[0]); c.close()")
+ANTES=$($PYTHON -c "import sqlite3; c=sqlite3.connect('data/scjn_tesis.db'); print(c.execute('SELECT COUNT(*) FROM tesis').fetchone()[0]); c.close()")
 
 # Ejecutar el actualizador
 $PYTHON updater/actualizar_bd.py >> "$LOG" 2>&1
 
 # Contar tesis DESPUÉS de actualizar
-DESPUES=$($PYTHON -c "import sqlite3; c=sqlite3.connect('scjn_tesis.db'); print(c.execute('SELECT COUNT(*) FROM tesis').fetchone()[0]); c.close()")
+DESPUES=$($PYTHON -c "import sqlite3; c=sqlite3.connect('data/scjn_tesis.db'); print(c.execute('SELECT COUNT(*) FROM tesis').fetchone()[0]); c.close()")
 
 NUEVAS=$((DESPUES - ANTES))
 

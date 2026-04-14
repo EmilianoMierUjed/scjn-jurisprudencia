@@ -1,15 +1,17 @@
 """
-Actualizador de la Base de Datos SCJN
-Descarga tesis nuevas desde la API oficial del Semanario Judicial.
+Actualizador / Descargador inicial de la Base de Datos SCJN
+Descarga tesis desde la API oficial del Semanario Judicial de la Federación.
 
-Adaptado de Script_SCJN.PY para ejecutarse como tarea programada en Windows.
-Usa la misma API y lógica de reanudación: recorre páginas de IDs,
-salta los que ya están en la BD, y solo descarga los nuevos.
+Sirve para DOS casos de uso:
+  1. Descarga inicial (BD vacía): crea la BD y descarga los ~311,000 criterios
+     desde cero. Tarda entre 4 y 6 horas. No requiere ningún archivo previo.
+  2. Actualización incremental: salta los IDs que ya están en la BD y sólo
+     descarga los nuevos. Ideal para correr semanalmente.
 
 Ejecutar:
-  - Automático: Task Scheduler de Windows (cada lunes 6:00 AM)
-  - Manual: doble clic en "Actualizar BD SCJN.bat"
-  - Terminal: python actualizar_bd.py
+  - Descarga inicial o incremental: python updater/actualizar_bd.py
+  - Automático en Windows: Task Scheduler (cada lunes 6:00 AM)
+  - Manual en Windows: doble clic en "Actualizar BD SCJN.bat"
 """
 
 import json
@@ -129,6 +131,56 @@ def obtener_tesis(id_tesis):
 
 # ── SQLite ───────────────────────────────────────────────────────────────
 
+def crear_esquema(conn):
+    """Crea la tabla tesis, el índice FTS5 y los triggers si no existen."""
+    conn.executescript("""
+        CREATE TABLE IF NOT EXISTS tesis (
+            id_tesis       TEXT PRIMARY KEY,
+            rubro          TEXT,
+            epoca          TEXT,
+            instancia      TEXT,
+            organo_juris   TEXT,
+            fuente         TEXT,
+            tipo_tesis     TEXT,
+            anio           INTEGER,
+            mes            TEXT,
+            materias       TEXT,
+            tesis_codigo   TEXT,
+            huella_digital TEXT,
+            texto          TEXT,
+            precedentes    TEXT,
+            fecha_descarga TEXT DEFAULT (datetime('now'))
+        );
+
+        CREATE VIRTUAL TABLE IF NOT EXISTS tesis_fts USING fts5(
+            rubro, texto, precedentes, materias,
+            content='tesis',
+            content_rowid='rowid',
+            tokenize='unicode61 remove_diacritics 2'
+        );
+
+        CREATE TRIGGER IF NOT EXISTS tesis_fts_insert
+            AFTER INSERT ON tesis BEGIN
+            INSERT INTO tesis_fts(rowid, rubro, texto, precedentes, materias)
+            VALUES (new.rowid, new.rubro, new.texto, new.precedentes, new.materias);
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS tesis_fts_update
+            AFTER UPDATE ON tesis BEGIN
+            UPDATE tesis_fts SET
+                rubro=new.rubro, texto=new.texto,
+                precedentes=new.precedentes, materias=new.materias
+            WHERE rowid=old.rowid;
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS tesis_fts_delete
+            AFTER DELETE ON tesis BEGIN
+            DELETE FROM tesis_fts WHERE rowid=old.rowid;
+        END;
+    """)
+    conn.commit()
+
+
 def obtener_ids_existentes(conn):
     cursor = conn.execute("SELECT id_tesis FROM tesis")
     return {fila[0] for fila in cursor.fetchall()}
@@ -141,13 +193,16 @@ def insertar_tesis(conn, tesis, id_tesis):
     else:
         materias_texto = str(materias)
 
+    # v1.2: ya no guardamos json_completo. La columna ocupaba ~612 MB sin
+    # ningún consumidor en runtime. Si alguna vez se necesita el JSON original,
+    # se puede regenerar desde la API SCJN con el id_tesis.
     conn.execute(
         """
         INSERT OR REPLACE INTO tesis (
             id_tesis, rubro, epoca, instancia, organo_juris, fuente,
             tipo_tesis, anio, mes, materias, tesis_codigo, huella_digital,
-            texto, precedentes, json_completo
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            texto, precedentes
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             str(tesis.get("idTesis", id_tesis)),
@@ -164,7 +219,6 @@ def insertar_tesis(conn, tesis, id_tesis):
             tesis.get("huellaDigital", ""),
             tesis.get("texto", ""),
             tesis.get("precedentes", ""),
-            json.dumps(tesis, ensure_ascii=False),
         ),
     )
 
@@ -187,10 +241,14 @@ def actualizar():
     logger.info("Iniciando actualizacion de BD SCJN")
     logger.info(f"BD: {DB_PATH}")
 
-    if not DB_PATH.exists():
-        logger.error(f"BD no encontrada en {DB_PATH}")
-        escribir_log_status("ERROR: BD no encontrada", 0, 1)
-        return
+    descarga_inicial = not DB_PATH.exists()
+    if descarga_inicial:
+        logger.info("Base de datos no encontrada — iniciando descarga inicial.")
+        logger.info(f"  Destino: {DB_PATH}")
+        logger.info("  Esto puede tardar entre 4 y 6 horas (~311,000 criterios).")
+        DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    else:
+        logger.info(f"BD existente encontrada en {DB_PATH}")
 
     # Verificar conectividad
     total_api = obtener_total_tesis()
@@ -201,6 +259,10 @@ def actualizar():
 
     conn = sqlite3.connect(str(DB_PATH))
     conn.execute("PRAGMA journal_mode=WAL")
+
+    if descarga_inicial:
+        logger.info("Creando esquema (tabla, FTS5, triggers)...")
+        crear_esquema(conn)
 
     ids_existentes = obtener_ids_existentes(conn)
     antes = len(ids_existentes)

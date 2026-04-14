@@ -27,8 +27,12 @@
 | huella_digital | TEXT | Hash |
 | texto | TEXT | Texto completo del criterio (avg ~1000 chars) |
 | precedentes | TEXT | Casos originarios |
-| json_completo | TEXT | JSON original de la API |
 | fecha_descarga | TEXT | Timestamp de descarga |
+
+> **v1.2:** la columna `json_completo` (JSON crudo de la API) se eliminó.
+> Pesaba ~612 MB y nadie la leía en runtime. La BD bajó de 1.7 GB a
+> ~990 MB. Si alguna vez se necesita el JSON original, se regenera desde
+> la API SCJN con el `id_tesis`.
 
 ## Cómo buscar con FTS5
 
@@ -69,10 +73,58 @@ FROM tesis WHERE id_tesis = 'ID_AQUI';
 
 ```
 Base_Datos_SCJN/
-├── server/server.py          ← MCP server (6 tools + protocolo de búsqueda)
+├── scjn_core/                ← Núcleo de búsqueda (paquete Python puro)
+│   ├── search.py             ← 10 tools de búsqueda (funciones puras)
+│   ├── tools_v12.py          ← 3 tools nuevas v1.2
+│   ├── protocol.py           ← INSTRUCCIONES (protocolo 5 rondas)
+│   ├── ranking.py            ← ORDEN_VINCULANTE_SQL + niveles S/A/B/C/D/E/F
+│   ├── filters.py            ← INSTANCIA_PRESETS + normalización de épocas
+│   ├── format.py             ← format_resultados con snippet
+│   ├── fts.py                ← Sanitización FTS5
+│   ├── errores.py            ← humanizar(exc) → mensajes accionables
+│   ├── database.py           ← connect(), has_fts()
+│   └── config.py             ← DB_PATH, MAX_*, get_logger
+├── server/server.py          ← MCP wrapper delgado para Claude Desktop
+├── cli/scjn_cli.py           ← CLI standalone con API Anthropic
 ├── updater/actualizar_bd.py  ← Actualizador incremental desde API SCJN
-├── install/                  ← Instalador Windows + setup FTS5
-├── scripts/                  ← Scripts de actualización manual
-├── docs/                     ← Documentación para instalador y abogado
-└── data/scjn_tesis.db        ← Base de datos (NO va en git)
+├── install/                  ← Instalador Windows + setup FTS5 + specs PyInstaller
+├── scripts/                  ← validar_bd, baseline, eliminar_json_completo
+├── tests/                    ← 82 tests pytest
+├── docs/                     ← Instalación, USO_ABOGADO + materiales de venta
+└── data/scjn_tesis.db        ← Base de datos (~990 MB, NO va en git)
 ```
+
+## Tools del MCP (v1.2 — 13 en total)
+
+| Tool | Propósito |
+|------|-----------|
+| `buscar_jurisprudencia` | OR de sinónimos + filtros (materia, instancia, órgano, años, épocas, buscar_en, orden) |
+| `buscar_interseccion` | AND entre 2-3 conceptos (cada uno con OR interno) |
+| `buscar_proximidad` | NEAR() de FTS5 — dos términos dentro de N tokens |
+| `buscar_rubro` | Busca sólo en el rubro (más preciso) |
+| `buscar_similares` | Dado un `id_tesis`, encuentra otras con rubro similar (BM25) |
+| `buscar_contradiccion` | Jurisprudencias surgidas de contradicción de tesis/criterios |
+| `leer_tesis_completa` | Texto completo + metadatos de una tesis |
+| `leer_varias_tesis` | Lee hasta 15 tesis en una llamada (batch) |
+| `explorar_valores` | Valores únicos de un campo (tipo_tesis, época, instancia, materias, órgano, fuente) |
+| `info_base_datos` | Totales, rango temporal, por tipo/instancia/época, estado FTS |
+| `extraer_cita_oficial` (v1.2) | Cita formal lista para pegar en escritos legales mexicanos |
+| `compilar_linea_jurisprudencial` (v1.2) | Cronología de jurisprudencias sobre un tema, agrupada por época |
+| `buscar_obligatorios_para_circuito` (v1.2) | Filtra criterios obligatorios para un circuito específico (1-32) |
+
+## Orden por fuerza vinculante (v1.1)
+
+El `ORDER BY` de las búsquedas jerarquiza por:
+1. Jurisprudencia antes que tesis aislada
+2. Bucket de órgano:
+   - 0 = Pleno SCJN (`instancia='Suprema Corte...' AND organo_juris LIKE 'pleno%'`)
+   - 1 = Salas SCJN (`... AND organo_juris LIKE '%sala%'`)
+   - 2 = Plenos Regionales
+   - 3 = Plenos de Circuito
+   - 4 = Tribunales Colegiados de Circuito
+   - 5 = Otros
+3. Rank BM25 (si hay FTS5)
+4. Año DESC
+
+Niveles mostrados en el output: S (Pleno SCJN), A (Salas SCJN), B (Plenos
+Regionales), C (Plenos de Circuito), D (TCC), E (Aislada SCJN), F (Aislada TCC).

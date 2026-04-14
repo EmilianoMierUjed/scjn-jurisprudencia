@@ -10,9 +10,11 @@ data/*.db-wal
 *.csv
 json/
 
-# Logs
+# Logs y archivos de estado del actualizador
 *.log
 data/*.log
+log_actualizacion.txt
+ultima_actualizacion.txt
 
 # Python
 __pycache__/
@@ -24,10 +26,11 @@ build/
 venv/
 .venv/
 
-# IDE
+# IDE y configuración local
 .vscode/
 .idea/
 *.sqbpro
+.claude/settings.local.json
 
 # OS
 .DS_Store
