@@ -1,7 +1,5 @@
 # Guia de Instalacion para el Instalador
 
-Esta guia es para Emiliano (el instalador), no para el abogado.
-
 ## Requisitos en la maquina del cliente
 
 - Windows 10 u 11
